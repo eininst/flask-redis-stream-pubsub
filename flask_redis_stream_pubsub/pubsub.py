@@ -37,7 +37,7 @@ SCHEDULER_PIPE_BUFFER_SIZE = 20
 SCHEDULER_INTERVAL = 0.2
 SCHEDULER_FIRST_DELAY = 1
 SCHEDULER_JOB_STREAM_MAX_LEN = 256
-SCHEDULER_LOCK_KEY_EX = 6
+SCHEDULER_LOCK_EX = 7
 
 CONSUMER_RETRY_LOOP_INTERVAL = 2
 CONSUMER_TASK_SPLIT_THRESHOLD = 20
@@ -475,7 +475,7 @@ class Consumer:
             for j in jobs:
                 key = f'{j["stream"]}_{j["next_time"]}'
                 uid = str(uuid.uuid4()).replace("-", "").upper()
-                await pipe.set(f'{key}', uid, ex=SCHEDULER_LOCK_KEY_EX, nx=True)
+                await pipe.set(f'{key}', uid, ex=SCHEDULER_LOCK_EX, nx=True)
 
             res = await pipe.execute()
 
