@@ -154,11 +154,11 @@ class Consumer:
     def __init__(self,
                  consumer_name: str,
                  group='',
-                 workers=4,
+                 workers=32,
                  retry_count=64,
                  timeout_second=300,
                  block_second=6,
-                 read_count=10,
+                 read_count=16,
                  config_prefix='PUBSUB_REDIS',
                  app_factory: str | Callable = None):
 
