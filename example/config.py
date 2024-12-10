@@ -1,4 +1,4 @@
-PUBSUB_REDIS_URL = 'redis://:password@r-host.redis.cn-chengdu.rds.aliyuncs.com:6379/0'
+PUBSUB_REDIS_URL = 'redis://:password@host:6379/0'
 PUBSUB_REDIS_OPTION = {
     'group':'pubsub_g1', #消息分组 -> redis XGROUP groupname
     'workers':10, #消费进程数
