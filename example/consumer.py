@@ -10,7 +10,6 @@ app.logger.setLevel(logging.INFO)
 if __name__ == '__main__':
     cs = Consumer(__name__)
 
-
     @cs.subscribe("hello_word")
     def hello_word(msg: Msg):
         """ 业务代码没抛出异常, 就代表消费成功 """
