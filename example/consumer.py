@@ -10,6 +10,7 @@ app.logger.setLevel(logging.INFO)
 if __name__ == '__main__':
     cs = Consumer(__name__)
 
+
     @cs.subscribe("hello_word")
     def hello_word(msg: Msg):
         """ 业务代码没抛出异常, 就代表消费成功 """
@@ -28,7 +29,8 @@ if __name__ == '__main__':
         """ 每5秒执行一次, 不重试 """
         current_app.logger.info(msg)
 
-    @cs.subscribe("hello_word_cron_15", cron="*/15  * * * *", retry_count=0)
+
+    @cs.subscribe("hello_word_cron_15", cron="*/15 * * * *", retry_count=0)
     def hello_word_cron_15(msg: Msg):
         """ 每15分钟执行一次, 不重试 """
         current_app.logger.info(msg)
