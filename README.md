@@ -110,3 +110,10 @@ PUBSUB_REDIS_OPTION = {
     'read_count': 16, #一次最多读取的消息数量 -> xreadgroup read_count=16
 }
 ```
+
+
+> See [examples](/example)
+
+## License
+
+*MIT*
