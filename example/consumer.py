@@ -8,18 +8,27 @@ app.config.from_object("example.config")
 app.logger.setLevel(logging.INFO)
 
 if __name__ == '__main__':
-    consumer = Consumer(__name__)
+    cs = Consumer(__name__)
 
-    @consumer.subscribe("hello_word")
+
+    @cs.subscribe("hello_word")
     def hello_word(msg: Msg):
+        """ 业务代码没抛出异常, 就代表消费成功 """
         current_app.logger.info(msg)
 
 
-    @consumer.subscribe("hello_word_cron", cron="*/5 * * * * *")
+    @cs.subscribe("hello_word", retry_count=3, timeout=30)
+    def hello_word(msg: Msg):
+        """ 重试3次, 每次间隔30秒 """
+        current_app.logger.info(msg)
+        raise RuntimeError("I will retry 3 times, with a 30 second interval between each attempt")
+
+
+    @cs.subscribe("hello_word_cron", cron="*/5 * * * * *", retry_count=0)
     def hello_word_cron(msg: Msg):
-        """ 每5秒执行一次 """
+        """ 每5秒执行一次, 不重试 """
         current_app.logger.info(msg)
 
 
-    consumer.init_app(app)
-    consumer.run("consumer:app")
+    cs.init_app(app)
+    cs.run("consumer:app")

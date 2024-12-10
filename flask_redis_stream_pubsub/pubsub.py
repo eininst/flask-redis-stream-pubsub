@@ -9,12 +9,15 @@ from functools import wraps
 from multiprocessing import current_process, Pool, Process
 from typing import Callable, Dict, List
 
+import math
 import redis
 from croniter import croniter
 from flask import Flask, current_app, has_app_context
 from flask.globals import app_ctx
 from werkzeug.utils import import_string, find_modules
 from redis import asyncio as aioredis
+
+from flask_redis_stream_pubsub import util
 
 RESET = '\033[0m'
 
@@ -36,10 +39,10 @@ SCHEDULER_FIRST_DELAY = 1
 SCHEDULER_JOB_STREAM_MAX_LEN = 256
 SCHEDULER_LOCK_KEY_EX = 8
 
-CONSUMER_RETRY_INTERVAL = 2
+CONSUMER_RETRY_LOOP_INTERVAL = 2
+CONSUMER_TASK_SPLIT_THRESHOLD = 16
 
 DEFAULT_STREAM_MAX_LEN = 2048
-
 
 class Msg:
     __slots__ = ['stream_name', 'id', 'group_name', 'payload', 'consumer_name', 'retry_count']
@@ -66,10 +69,6 @@ class Msg:
         if '__PUBLISH_TIME' in self.payload:
             return int(self.payload['__PUBLISH_TIME'])
         return 0
-
-
-def _chunk_array(arr, size):
-    return [arr[i:i + size] for i in range(0, len(arr), size)]
 
 
 class Producer:
@@ -131,7 +130,7 @@ class ProducerSession:
         __msgs = self.msgs[:]
         self.clear()
 
-        __msg_groups = _chunk_array(__msgs, PRODUCER_SESSION_BUFFER_SIZE)
+        __msg_groups = util.chunk_array(__msgs, PRODUCER_SESSION_BUFFER_SIZE)
         res = []
 
         for msg_list in __msg_groups:
@@ -196,6 +195,19 @@ class Consumer:
         self.redis_url = redis_url
         self.__init_config(cfg)
 
+    def init_app(self, app: Flask):
+        redis_url = app.config.get(
+            "{0}_URL".format(self.config_prefix), "redis://localhost:6379/0"
+        )
+        self.redis_url = redis_url
+
+        cfg = app.config.get(f'{self.config_prefix}_OPTION')
+
+        if not cfg:
+            return
+
+        self.__init_config(cfg)
+
     def __init_config(self, cfg):
         if 'group' in cfg:
             self.group = cfg['group']
@@ -211,19 +223,6 @@ class Consumer:
             self.read_count = cfg['read_count']
         if 'app_factory' in cfg:
             self.app_factory = cfg['app_factory']
-
-    def init_app(self, app: Flask):
-        redis_url = app.config.get(
-            "{0}_URL".format(self.config_prefix), "redis://localhost:6379/0"
-        )
-        self.redis_url = redis_url
-
-        cfg = app.config.get(f'{self.config_prefix}_OPTION')
-
-        if not cfg:
-            return
-
-        self.__init_config(cfg)
 
     def import_module(self, module: str):
         for name in find_modules(module, recursive=True, include_packages=False):
@@ -288,11 +287,106 @@ class Consumer:
 
         return decoration
 
+    def run(self, app_factory: str | Callable = None, **kwargs):
+        redis_url = kwargs.get('redis_url')
+        group = kwargs.get('group')
+        workers = kwargs.get("workers")
+        retry_count = kwargs.get("retry_count")
+        timeout_second = kwargs.get("timeout_second")
+        block_second = kwargs.get("block_second")
+        read_count = kwargs.get("read_count")
+        config_prefix = kwargs.get("config_prefix")
+
+        if redis_url:
+            self.redis_url = redis_url
+        if group:
+            self.group = group
+        if workers:
+            self.workers = workers
+        if retry_count:
+            self.read_count = retry_count
+        if timeout_second:
+            self.timeout_mill = int(timeout_second) * 1000
+        if block_second:
+            self.block_mill = int(block_second) * 1000
+        if read_count:
+            self.read_count = read_count
+        if config_prefix:
+            self.config_prefix = config_prefix
+
+        try:
+            from uvloop import run
+            logger.info(f'PID({os.getpid()}) {'\033[1m'}uvloop runing...{RESET}')
+        except ImportError:
+            from asyncio import run
+            logger.info(f'PID({os.getpid()}) {'\033[1m'}eventloop runing...{RESET}')
+
+        run(self.run_async(app_factory))
+
+    async def run_async(self, app_factory: str | Callable = None):
+        if app_factory is None:
+            app_factory = self.app_factory
+
+        self.woker_pool = Pool(self.workers, initializer=self.__init_process, initargs=(app_factory,))
+        self.rcli = aioredis.from_url(self.redis_url, decode_responses=True)
+
+        __fix_call_map = {}
+        job_list = []
+
+        for k, v in self.__call_map.items():
+            __fix_call_map[k] = {
+                'fc': getattr(v['module'], v['name']),
+                'timeout': v['timeout'],
+                'retry_count': v['retry_count'],
+            }
+
+            try:
+                await self.rcli.xgroup_create(name=k, groupname=self.group, id='0', mkstream=True)
+            except redis.exceptions.ResponseError:
+                pass
+
+            if v['type'] == 'cron':
+                job_list.append(v)
+
+        if not __fix_call_map:
+            raise RuntimeError('Not subscribe')
+
+        parts = math.ceil(len(__fix_call_map) / CONSUMER_TASK_SPLIT_THRESHOLD)
+        call_map_groups = util.split_dict(__fix_call_map, parts)
+
+        tasks = []
+        for __call_map in call_map_groups:
+            tasks.append(self.__xread(__call_map))
+            tasks.append(self.__retry(__call_map))
+
+        if job_list:
+            tasks.append(self.__scheduler(job_list))
+
+        logger.info(
+            f"PID({os.getpid()}) {'\033[94m'}Parameters: workers={self.workers},consumer_name={self.consumer_name},group_id={self.group}{RESET}")
+        logger.info(
+            f"PID({os.getpid()}) {'\033[96m'}Discovery of subscribers: {",".join(__fix_call_map.keys())}{RESET}")
+
+        def __shutdown(signum, frame):
+            self.__runing = False
+            logger.warning(
+                f"PID({os.getpid()}) {'\033[93m'}Listen signum:{signum}, Start to shutdown...PID({os.getpid()}){RESET}")
+
+        signal.signal(signal.SIGINT, __shutdown)
+        signal.signal(signal.SIGTERM, __shutdown)
+
+        await asyncio.gather(*tasks)
+
+        self.woker_pool.close()
+        self.woker_pool.join()
+
+        logger.info(f"PID({os.getpid()}) {'\033[92m'}Shutting down consumer successfully PID({os.getpid()}){RESET}")
+
     async def __retry(self, fix_call_map):
         while self.__runing:
             async with self.rcli.pipeline() as pipe:
                 stream_list = []
-                for k, val in self.__call_map.items():
+                for k, val in fix_call_map.items():
                     _timeout_mill = self.timeout_mill
                     _opt_timeout = val['timeout']
 
@@ -335,7 +429,7 @@ class Consumer:
                         await self.rcli.xdel(name, *message_del_ids)
 
                 if message_ids and name in fix_call_map:
-                    call = fix_call_map[name]
+                    call = fix_call_map[name]['fc']
                     xmsgs = await self.rcli.xclaim(name, self.group,
                                                    self.consumer_name, timeout_mill, message_ids)
 
@@ -353,9 +447,11 @@ class Consumer:
             if call_count > 0:
                 await asyncio.sleep(0)
             else:
-                await asyncio.sleep(CONSUMER_RETRY_INTERVAL)
+                await asyncio.sleep(CONSUMER_RETRY_LOOP_INTERVAL)
 
-    async def __xread(self, fix_call_map, streams):
+    async def __xread(self, fix_call_map):
+        streams = {key: ">" for key in fix_call_map.keys()}
+
         while self.__runing:
             rets = await self.rcli.xreadgroup(self.group, self.consumer_name, streams,
                                               count=self.read_count, block=self.block_mill)
@@ -371,7 +467,7 @@ class Consumer:
 
                     _msg = Msg(stream, id, self.group, payload, self.consumer_name)
 
-                    call = fix_call_map[stream]
+                    call = fix_call_map[stream]['fc']
                     self.woker_pool.apply_async(call, (_msg,))
 
     async def __job_pipe_xadds(self, jobs):
@@ -425,98 +521,10 @@ class Consumer:
                     job['last_time'] = _next_time
 
             if zjobs_list:
-                chunkd_jobs = _chunk_array(zjobs_list, SCHEDULER_PIPE_BUFFER_SIZE)
+                chunkd_jobs = util.chunk_array(zjobs_list, SCHEDULER_PIPE_BUFFER_SIZE)
                 await asyncio.gather(*map(self.__job_pipe_xadds, chunkd_jobs))
 
             await asyncio.sleep(SCHEDULER_INTERVAL)
-
-    def run(self, app_factory: str | Callable = None, **kwargs):
-        redis_url = kwargs.get('redis_url')
-        group = kwargs.get('group')
-        workers = kwargs.get("workers")
-        retry_count = kwargs.get("retry_count")
-        timeout_second = kwargs.get("timeout_second")
-        block_second = kwargs.get("block_second")
-        read_count = kwargs.get("read_count")
-        config_prefix = kwargs.get("config_prefix")
-
-        if redis_url:
-            self.redis_url = redis_url
-        if group:
-            self.group = group
-        if workers:
-            self.workers = workers
-        if retry_count:
-            self.read_count = retry_count
-        if timeout_second:
-            self.timeout_mill = int(timeout_second)*1000
-        if block_second:
-            self.block_mill = int(block_second) * 1000
-        if read_count:
-            self.read_count = read_count
-        if config_prefix:
-            self.config_prefix = config_prefix
-
-        try:
-            from uvloop import run
-            logger.info(f'PID({os.getpid()}) {'\033[1m'}uvloop runing...{RESET}')
-        except ImportError:
-            from asyncio import run
-            logger.info(f'PID({os.getpid()}) {'\033[1m'}eventloop runing...{RESET}')
-
-        run(self.run_async(app_factory))
-
-    async def run_async(self, app_factory: str | Callable = None):
-        if app_factory is None:
-            app_factory = self.app_factory
-
-        self.woker_pool = Pool(self.workers, initializer=self.__init_process, initargs=(app_factory,))
-
-        self.rcli = aioredis.from_url(self.redis_url, decode_responses=True)
-
-        __fix_call_map = {}
-        streams = {}
-
-        job_list = []
-        for k, v in self.__call_map.items():
-            __fix_call_map[k] = getattr(v['module'], v['name'])
-            streams[k] = '>'
-            try:
-                await self.rcli.xgroup_create(name=k, groupname=self.group, id='0', mkstream=True)
-            except redis.exceptions.ResponseError:
-                pass
-
-            if v['type'] == 'cron':
-                job_list.append(v)
-
-        if not __fix_call_map:
-            raise RuntimeError('Not subscribe')
-
-        logger.info(
-            f"PID({os.getpid()}) {'\033[94m'}Parameters: workers={self.workers},consumer_name={self.consumer_name},group_id={self.group}{RESET}")
-        logger.info(f"PID({os.getpid()}) {'\033[96m'}Discovery of subscribers: {",".join(streams.keys())}{RESET}")
-
-        def __shutdown(signum, frame):
-            self.__runing = False
-            logger.warning(
-                f"PID({os.getpid()}) {'\033[93m'}Listen signum:{signum}, Start to shutdown...PID({os.getpid()}){RESET}")
-
-        signal.signal(signal.SIGINT, __shutdown)
-        signal.signal(signal.SIGTERM, __shutdown)
-
-        tasks = [
-            self.__xread(__fix_call_map, streams),
-            self.__retry(__fix_call_map),
-        ]
-        if job_list:
-            tasks.append(self.__scheduler(job_list))
-
-        await asyncio.gather(*tasks)
-
-        self.woker_pool.close()
-        self.woker_pool.join()
-
-        logger.info(f"PID({os.getpid()}) {'\033[92m'}Shutting down consumer successfully PID({os.getpid()}){RESET}")
 
     def __init_process(self, app_factory: str | Callable):
         app: Flask
