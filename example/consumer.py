@@ -17,8 +17,8 @@ if __name__ == '__main__':
         current_app.logger.info(msg)
 
 
-    @cs.subscribe("hello_word", retry_count=3, timeout=30)
-    def hello_word(msg: Msg):
+    @cs.subscribe("hello_word_retry", retry_count=3, timeout=30)
+    def hello_word_retry(msg: Msg):
         """ 重试3次, 每次间隔30秒 """
         current_app.logger.info(msg)
         raise RuntimeError("I will retry 3 times, with a 30 second interval between each attempt")
