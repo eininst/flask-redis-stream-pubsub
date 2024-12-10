@@ -28,6 +28,11 @@ if __name__ == '__main__':
         """ 每5秒执行一次, 不重试 """
         current_app.logger.info(msg)
 
+    @cs.subscribe("hello_word_cron_15", cron="*/15  * * * *", retry_count=0)
+    def hello_word_cron_15(msg: Msg):
+        """ 每15分钟执行一次, 不重试 """
+        current_app.logger.info(msg)
+
 
     cs.init_app(app)
     cs.run("consumer:app")
