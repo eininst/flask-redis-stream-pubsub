@@ -27,7 +27,7 @@ logger.setLevel(logging.INFO)
 ch = logging.StreamHandler()
 ch.setLevel(logger.level)
 
-formatter = logging.Formatter(f"[%(asctime)s] RS %(levelname)s - %(message)s")
+formatter = logging.Formatter(f"[%(asctime)s] PUBSUB %(levelname)s - %(message)s")
 ch.setFormatter(formatter)
 logger.addHandler(ch)
 
