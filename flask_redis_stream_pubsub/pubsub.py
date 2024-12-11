@@ -1,5 +1,4 @@
 import asyncio
-import datetime
 import logging
 import os
 import signal
@@ -22,7 +21,7 @@ from flask_redis_stream_pubsub import util
 
 RESET = '\033[0m'
 
-logger = logging.getLogger("rs")
+logger = logging.getLogger("pubsub")
 logger.setLevel(logging.INFO)
 
 ch = logging.StreamHandler()
