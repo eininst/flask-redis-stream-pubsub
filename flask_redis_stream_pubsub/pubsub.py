@@ -497,11 +497,13 @@ class Consumer:
 
     async def __scheduler(self, jobs):
         __jobs = []
+
+        start_time = time.time()
         for job in jobs:
             __jobs.append({
                 'iter': job['iter'],
                 'stream': job['stream'],
-                'last_time': 0,
+                'last_time': int(job['iter'].get_next(start_time=start_time)),
             })
 
         while self.__runing:
@@ -511,12 +513,12 @@ class Consumer:
             for job in __jobs:
                 _next_time = int(job['iter'].get_next(start_time=current_time))
 
-                if job['last_time'] > 0 and job['last_time'] != _next_time:
+                if job['last_time'] != _next_time:
                     zjobs.append({
                         'stream': job["stream"],
                         'next_time': _next_time,
                     })
-                job['last_time'] = _next_time
+                    job['last_time'] = _next_time
 
             if zjobs:
                 chunkd_jobs = util.chunk_array(zjobs, SCHEDULER_PIPE_BUFFER_SIZE)
@@ -553,7 +555,7 @@ def runs(*consumers: Consumer, app_factory: str | Callable = None):
     plist = []
 
     for c in consumers:
-        p = Process(target=c.run, args=(app_factory, ))
+        p = Process(target=c.run, args=(app_factory,))
         plist.append(p)
         p.start()
 
