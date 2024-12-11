@@ -554,7 +554,7 @@ def runs(*consumers: Consumer, app_factory: str | Callable = None):
     plist = []
 
     for c in consumers:
-        p = Process(target=c.run, args=(app_factory,))
+        p = Process(target=c.run, args=(app_factory, ))
         plist.append(p)
         p.start()
 
