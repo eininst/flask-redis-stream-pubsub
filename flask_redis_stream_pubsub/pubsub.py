@@ -289,6 +289,16 @@ class Consumer:
         return decoration
 
     def run(self, app_factory: str | Callable = None, **kwargs):
+        try:
+            from uvloop import run
+            logger.info(f'PID({os.getpid()}) {'\033[1m'}uvloop runing...{RESET}')
+        except ImportError:
+            from asyncio import run
+            logger.info(f'PID({os.getpid()}) {'\033[1m'}eventloop runing...{RESET}')
+
+        run(self.run_async(app_factory, **kwargs))
+
+    async def run_async(self, app_factory: str | Callable = None, **kwargs):
         redis_url = kwargs.get('redis_url')
         group = kwargs.get('group')
         workers = kwargs.get("workers")
@@ -315,16 +325,6 @@ class Consumer:
         if config_prefix:
             self.config_prefix = config_prefix
 
-        try:
-            from uvloop import run
-            logger.info(f'PID({os.getpid()}) {'\033[1m'}uvloop runing...{RESET}')
-        except ImportError:
-            from asyncio import run
-            logger.info(f'PID({os.getpid()}) {'\033[1m'}eventloop runing...{RESET}')
-
-        run(self.run_async(app_factory))
-
-    async def run_async(self, app_factory: str | Callable = None):
         if app_factory is None:
             app_factory = self.app_factory
 
@@ -512,13 +512,12 @@ class Consumer:
             for job in __jobs:
                 _next_time = int(job['iter'].get_next(start_time=current_time))
 
-                if (job['last_time'] != _next_time or
-                        (job['last_time'] == 0 and current_time >= _next_time)):
+                if job['last_time'] > 0 and job['last_time'] != _next_time:
                     zjobs.append({
                         'stream': job["stream"],
                         'next_time': _next_time,
                     })
-                    job['last_time'] = _next_time
+                job['last_time'] = _next_time
 
             if zjobs:
                 chunkd_jobs = util.chunk_array(zjobs, SCHEDULER_PIPE_BUFFER_SIZE)
