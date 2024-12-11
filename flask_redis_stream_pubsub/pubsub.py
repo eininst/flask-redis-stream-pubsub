@@ -1,4 +1,5 @@
 import asyncio
+import datetime
 import logging
 import os
 import signal
@@ -35,7 +36,6 @@ PRODUCER_SESSION_BUFFER_SIZE = 32
 
 SCHEDULER_PIPE_BUFFER_SIZE = 20
 SCHEDULER_INTERVAL = 0.2
-SCHEDULER_FIRST_DELAY = 1
 SCHEDULER_JOB_STREAM_MAX_LEN = 256
 SCHEDULER_LOCK_EX = 7
 
@@ -43,6 +43,7 @@ CONSUMER_RETRY_LOOP_INTERVAL = 2
 CONSUMER_TASK_SPLIT_THRESHOLD = 20
 
 DEFAULT_STREAM_MAX_LEN = 2048
+
 
 class Msg:
     __slots__ = ['stream_name', 'id', 'group_name', 'payload', 'consumer_name', 'retry_count']
@@ -496,8 +497,6 @@ class Consumer:
             return xcount
 
     async def __scheduler(self, jobs):
-        await asyncio.sleep(SCHEDULER_FIRST_DELAY)
-
         __jobs = []
         for job in jobs:
             __jobs.append({
@@ -508,20 +507,21 @@ class Consumer:
 
         while self.__runing:
             current_time = time.time()
-            zjobs_list = []
+            zjobs = []
 
             for job in __jobs:
-                _next_time = job['iter'].get_next(start_time=current_time)
+                _next_time = int(job['iter'].get_next(start_time=current_time))
 
-                if job['last_time'] != _next_time:
-                    zjobs_list.append({
+                if (job['last_time'] != _next_time or
+                        (job['last_time'] == 0 and current_time >= _next_time)):
+                    zjobs.append({
                         'stream': job["stream"],
                         'next_time': _next_time,
                     })
                     job['last_time'] = _next_time
 
-            if zjobs_list:
-                chunkd_jobs = util.chunk_array(zjobs_list, SCHEDULER_PIPE_BUFFER_SIZE)
+            if zjobs:
+                chunkd_jobs = util.chunk_array(zjobs, SCHEDULER_PIPE_BUFFER_SIZE)
                 await asyncio.gather(*map(self.__job_pipe_xadds, chunkd_jobs))
 
             await asyncio.sleep(SCHEDULER_INTERVAL)
