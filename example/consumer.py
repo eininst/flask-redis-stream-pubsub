@@ -1,7 +1,7 @@
 import logging
 
 from flask import Flask, current_app
-from flask_redis_stream_pubsub.pubsub import Consumer, Msg
+from flask_redis_stream_pubsub.pubsub import Consumer, Msg, runs
 
 app = Flask(__name__)
 app.config.from_object("example.config")
@@ -30,7 +30,7 @@ if __name__ == '__main__':
         current_app.logger.info(msg)
 
 
-    @cs.subscribe("hello_word_cron_15", cron="*/15 * * * *", retry_count=0)
+    @cs.subscribe("hello_word_cron_15", cron="*/10 * * * * *", retry_count=0)
     def hello_word_cron_15(msg: Msg):
         """ 每15分钟执行一次, 不重试 """
         current_app.logger.info(msg)
