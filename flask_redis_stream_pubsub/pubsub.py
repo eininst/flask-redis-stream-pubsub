@@ -234,7 +234,7 @@ class Consumer:
 
         def decoration(f):
             if stream in self.__call_map:
-                raise RuntimeError(f'{stream} Already exists of call_map')
+                raise RuntimeError(f'{stream} Already exists of subscribes')
 
             module = __import__(f.__module__, fromlist=[''])
             name = f.__name__
