@@ -1,6 +1,6 @@
 from flask import Flask
 
-from flask_redis_stream_pubsub.pubsub import Producer
+from flask_redis_stream_pubsub.producer import Producer
 
 app = Flask(__name__)
 app.config.from_object("example.config")
@@ -10,7 +10,7 @@ if __name__ == '__main__':
 
     producer.init_app(app)
 
-    msgid = producer.publish("hello_word", {'name': 'dog'})
+    msgid = producer.publish("hello_word_retry", {'name': 'dog'})
     print(msgid)
 
 
@@ -22,5 +22,5 @@ if __name__ == '__main__':
     sess.add("hello_word", {'name': 'cat4'})
     sess.add("hello_word", {'name': 'cat5'})
 
-    msgids = sess.publish()
+    msgids = sess.commit()
     print(msgids)

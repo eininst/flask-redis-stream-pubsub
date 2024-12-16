@@ -1,13 +1,19 @@
 import logging
+import time
 
 from flask import Flask, current_app
-from flask_redis_stream_pubsub.pubsub import Consumer, Msg, runs
+from flask_redis_stream_pubsub.consumer import Consumer, Msg, runs
 
 app = Flask(__name__)
 app.config.from_object("example.config")
 app.logger.setLevel(logging.INFO)
 
 if __name__ == '__main__':
+    import multiprocessing as mp
+
+    mp.set_start_method('fork')
+
+
     cs = Consumer(__name__)
 
 
@@ -17,22 +23,22 @@ if __name__ == '__main__':
         current_app.logger.info(msg)
 
 
-    @cs.subscribe("hello_word_retry", retry_count=3, timeout=30)
+    @cs.subscribe("hello_word_retry", retry_count=3, timeout=10)
     def hello_word_retry(msg: Msg):
         """ 重试3次, 每次间隔30秒 """
         current_app.logger.info(msg)
         raise RuntimeError("I will retry 3 times, with a 30 second interval between each attempt")
 
 
-    @cs.subscribe("hello_word_cron", cron="*/5 * * * * *", retry_count=0)
+    @cs.subscribe("hello_word_cron", cron="*/3 * * * * *", retry_count=0)
     def hello_word_cron(msg: Msg):
         """ 每5秒执行一次, 不重试 """
         current_app.logger.info(msg)
 
 
-    @cs.subscribe("hello_word_cron_15", cron="*/10 * * * * *", retry_count=0)
+    @cs.subscribe("hello_word_cron_15", cron="*/10 * * * *", retry_count=0)
     def hello_word_cron_15(msg: Msg):
-        """ 每15分钟执行一次, 不重试 """
+        """ 每10分钟执行一次, 不重试 """
         current_app.logger.info(msg)
 
 

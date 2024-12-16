@@ -1,19 +1,19 @@
 import asyncio
 import logging
-import os
 import signal
 import time
 import traceback
 import uuid
+import os
+from concurrent.futures import ThreadPoolExecutor
 from functools import wraps
-from multiprocessing import current_process, Pool, Process
-from typing import Callable, Dict, List
+from multiprocessing import current_process, Pool
+from typing import Callable, Dict
 
 import math
 import redis
 from croniter import croniter
-from flask import Flask, current_app, has_app_context
-from flask.globals import app_ctx
+from flask import Flask, current_app
 from werkzeug.utils import import_string, find_modules
 from redis import asyncio as aioredis
 
@@ -31,8 +31,6 @@ formatter = logging.Formatter(f"[%(asctime)s] PUBSUB %(levelname)s - %(message)s
 ch.setFormatter(formatter)
 logger.addHandler(ch)
 
-PRODUCER_SESSION_BUFFER_SIZE = 32
-
 SCHEDULER_PIPE_BUFFER_SIZE = 20
 SCHEDULER_INTERVAL = 0.2
 SCHEDULER_JOB_STREAM_MAX_LEN = 256
@@ -41,7 +39,12 @@ SCHEDULER_LOCK_EX = 7
 CONSUMER_RETRY_LOOP_INTERVAL = 3
 CONSUMER_TASK_SPLIT_THRESHOLD = 20
 
-DEFAULT_STREAM_MAX_LEN = 2048
+
+def _thread_excute(fc, msg):
+    if current_process().thread_pool is None:
+        fc(msg)
+    else:
+        current_process().thread_pool.submit(fc, msg)
 
 
 class Msg:
@@ -71,90 +74,13 @@ class Msg:
         return 0
 
 
-class Producer:
-    __slots__ = ['maxlen', '__rcli']
-
-    def __init__(self, redis_url='', maxlen=DEFAULT_STREAM_MAX_LEN):
-        self.maxlen = maxlen
-        self.__rcli = None
-        if redis_url:
-            self.__rcli = redis.from_url(redis_url, decode_responses=True)
-
-    def init_redis(self, redis_url=''):
-        self.__rcli = redis.from_url(redis_url, decode_responses=True)
-
-    def init_app(self, app: Flask, config_prefix='PUBSUB_REDIS'):
-        redis_url = app.config.get(
-            "{0}_URL".format(config_prefix), "redis://localhost:6379/0"
-        )
-
-        rcli = redis.from_url(redis_url, decode_responses=True)
-        self.__rcli = rcli
-
-    def publish(self, stream_name: str, payload: dict, maxlen=None):
-        __maxlen = maxlen if maxlen else self.maxlen
-        payload['__PUBLISH_TIME'] = int(time.time() * 1000)
-        payload['__SOURCE'] = 'producer'
-        return self.__rcli.xadd(stream_name, payload, maxlen=__maxlen)
-
-    @property
-    def session(self):
-        if has_app_context():
-            if not hasattr(app_ctx, 'producer_session'):
-                app_ctx.producer_session = ProducerSession(self.__rcli, self.maxlen)
-            return app_ctx.producer_session
-
-        return ProducerSession(self.__rcli, self.maxlen)
-
-
-class ProducerSession:
-    __slots__ = ['__rcli', 'maxlen', 'msgs']
-
-    def __init__(self, rcli: redis.Redis, maxlen=None):
-        self.__rcli = rcli
-        self.msgs = []  # type:List
-        self.maxlen = maxlen
-
-    def add(self, stream_name: str, payload: dict, maxlen=None):
-        __maxlen = maxlen if maxlen else self.maxlen
-        self.msgs.append({
-            'name': stream_name,
-            'payload': payload,
-            'maxlen': maxlen,
-        })
-
-    def clear(self):
-        self.msgs = []
-
-    def publish(self):
-        __msgs = self.msgs[:]
-        self.clear()
-
-        __msg_groups = util.chunk_array(__msgs, PRODUCER_SESSION_BUFFER_SIZE)
-        res = []
-
-        for msg_list in __msg_groups:
-            with self.__rcli.pipeline() as pipe:
-                current_time = int(time.time() * 1000)
-                for msg in msg_list:
-                    payload = msg['payload']
-                    payload['__PUBLISH_TIME'] = current_time
-                    payload['__SOURCE'] = 'producer'
-                    pipe.xadd(msg['name'], payload, maxlen=msg['maxlen'])
-
-                pipe_res = pipe.execute()
-                if isinstance(pipe_res, list):
-                    res.extend(pipe_res)
-
-        return res
-
-
 class Consumer:
 
     def __init__(self,
                  consumer_name: str,
                  group='',
-                 workers=32,
+                 processes=1,
+                 threads=1,
                  retry_count=64,
                  timeout_second=300,
                  block_second=6,
@@ -168,14 +94,15 @@ class Consumer:
         self.block_mill = block_second * 1000
         self.read_count = read_count
         self.rcli = None
-        self.workers = workers
+        self.processes = processes
+        self.threads = threads
         self.retry_count = retry_count
         self.consumer_name = consumer_name
 
         self.__runing = True
         self.__call_map = {}
         self.xgroup_check = None
-        self.woker_pool = None
+        self.process_pool = None
 
         self.config_prefix = config_prefix
         self.redis_url = ''
@@ -211,8 +138,10 @@ class Consumer:
     def __init_config(self, cfg):
         if 'group' in cfg:
             self.group = cfg['group']
-        if 'workers' in cfg:
-            self.workers = cfg['workers']
+        if 'processes' in cfg:
+            self.processes = cfg['processes']
+        if 'threads' in cfg:
+            self.threads = cfg['threads']
         if 'retry_count' in cfg:
             self.retry_count = cfg['retry_count']
         if 'timeout_second' in cfg:
@@ -265,6 +194,7 @@ class Consumer:
             @wraps(f)
             def wrapper(*args, **kwargs):
                 with current_process().app.app_context():
+
                     ack = False
                     try:
                         msg = args[0]
@@ -300,7 +230,8 @@ class Consumer:
     async def run_async(self, app_factory: str | Callable = None, **kwargs):
         redis_url = kwargs.get('redis_url')
         group = kwargs.get('group')
-        workers = kwargs.get("workers")
+        processes = kwargs.get("processes")
+        threads = kwargs.get("threads")
         retry_count = kwargs.get("retry_count")
         timeout_second = kwargs.get("timeout_second")
         block_second = kwargs.get("block_second")
@@ -311,8 +242,10 @@ class Consumer:
             self.redis_url = redis_url
         if group:
             self.group = group
-        if workers:
-            self.workers = workers
+        if processes:
+            self.processes = processes
+        if threads:
+            self.threads = threads
         if retry_count:
             self.read_count = retry_count
         if timeout_second:
@@ -327,7 +260,8 @@ class Consumer:
         if app_factory is None:
             app_factory = self.app_factory
 
-        self.woker_pool = Pool(self.workers, initializer=self.__init_process, initargs=(app_factory,))
+        self.process_pool = Pool(processes=self.processes,
+                                 initializer=self.__init_process, initargs=(app_factory, self.threads))
         self.rcli = aioredis.from_url(self.redis_url, decode_responses=True)
 
         __fix_call_map = {}
@@ -363,7 +297,7 @@ class Consumer:
             tasks.append(self.__scheduler(job_list))
 
         logger.info(
-            f"PID({os.getpid()}) {'\033[94m'}Parameters: workers={self.workers},consumer_name={self.consumer_name},group_id={self.group}{RESET}")
+            f"PID({os.getpid()}) {'\033[94m'}Parameters: processes={self.processes},threads={self.threads},consumer_name={self.consumer_name},group_id={self.group}{RESET}")
         logger.info(
             f"PID({os.getpid()}) {'\033[96m'}Discovery of subscribers: {",".join(__fix_call_map.keys())}{RESET}")
 
@@ -377,8 +311,8 @@ class Consumer:
 
         await asyncio.gather(*tasks)
 
-        self.woker_pool.close()
-        self.woker_pool.join()
+        self.process_pool.terminate()
+        self.process_pool.join()
 
         logger.info(f"PID({os.getpid()}) {'\033[92m'}Shutting down consumer successfully PID({os.getpid()}){RESET}")
 
@@ -441,7 +375,8 @@ class Consumer:
                         _msg = Msg(name, id, self.group, payload,
                                    self.consumer_name, retry_count=times_delivered)
 
-                        self.woker_pool.apply_async(call, (_msg,))
+                        self.process_pool.apply_async(_thread_excute, (call, _msg,))
+
                         call_count += 1
 
             if call_count > 0:
@@ -468,7 +403,8 @@ class Consumer:
                     _msg = Msg(stream, id, self.group, payload, self.consumer_name)
 
                     call = fix_call_map[stream]['fc']
-                    self.woker_pool.apply_async(call, (_msg,))
+
+                    self.process_pool.apply_async(_thread_excute, (call, _msg,))
 
     async def __job_pipe_xadds(self, jobs):
         async with self.rcli.pipeline() as pipe:
@@ -526,7 +462,7 @@ class Consumer:
 
             await asyncio.sleep(SCHEDULER_INTERVAL)
 
-    def __init_process(self, app_factory: str | Callable):
+    def __init_process(self, app_factory: str | Callable, threads: int):
         app: Flask
         if isinstance(app_factory, str):
             app = import_string(app_factory)
@@ -547,12 +483,25 @@ class Consumer:
         current_process().rcli = rcli
         current_process().app = app
 
+        thread_pool = None
+        if threads > 1:
+            thread_pool = ThreadPoolExecutor(max_workers=threads, thread_name_prefix='PUBSUB')
+            current_process().thread_pool = thread_pool
+
+        def shutdown(signum, frame):
+            if thread_pool is not None:
+                thread_pool.shutdown()
+
+        signal.signal(signal.SIGTERM, shutdown)
+
 
 def runs(*consumers: Consumer, app_factory: str | Callable = None):
     if len(consumers) == 0:
         raise RuntimeError("consumers cannot be empty")
 
     plist = []
+
+    from multiprocessing import Process
 
     for c in consumers:
         p = Process(target=c.run, args=(app_factory,))
