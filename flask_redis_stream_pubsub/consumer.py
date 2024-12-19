@@ -85,6 +85,7 @@ class Consumer:
                  timeout_second=300,
                  block_second=6,
                  read_count=16,
+                 noack=False,
                  config_prefix='PUBSUB_REDIS',
                  app_factory: str | Callable = None):
 
@@ -98,6 +99,7 @@ class Consumer:
         self.threads = threads
         self.retry_count = retry_count
         self.consumer_name = consumer_name
+        self.noack = noack
 
         self.__runing = True
         self.__call_map = {}
@@ -150,6 +152,9 @@ class Consumer:
             self.block_mill = int(cfg['block_second']) * 1000
         if 'read_count' in cfg:
             self.read_count = cfg['read_count']
+        if 'noack' in cfg:
+            self.noack = cfg['noack']
+
         if 'app_factory' in cfg:
             self.app_factory = cfg['app_factory']
 
@@ -194,7 +199,6 @@ class Consumer:
             @wraps(f)
             def wrapper(*args, **kwargs):
                 with current_process().app.app_context():
-
                     ack = False
                     try:
                         msg = args[0]
@@ -205,13 +209,14 @@ class Consumer:
                         current_app.logger.error(f'\033[91m{traceback.format_exc()}')
                         raise e
                     finally:
+                        if current_process().noack:
+                            return
+
                         cli = current_process().rcli
                         if retry_count <= 0:
                             ack = True
                         if ack:
-                            ack_result = cli.xack(msg.stream_name, msg.group_name, msg.id)
-                            if ack_result == 1:
-                                cli.xdel(msg.stream_name, msg.id)
+                            cli.xack(msg.stream_name, msg.group_name, msg.id)
 
             return wrapper
 
@@ -236,6 +241,7 @@ class Consumer:
         timeout_second = kwargs.get("timeout_second")
         block_second = kwargs.get("block_second")
         read_count = kwargs.get("read_count")
+        noack = kwargs.get("noack")
         config_prefix = kwargs.get("config_prefix")
 
         if redis_url:
@@ -256,12 +262,14 @@ class Consumer:
             self.read_count = read_count
         if config_prefix:
             self.config_prefix = config_prefix
+        if noack is not None:
+            self.noack = noack
 
         if app_factory is None:
             app_factory = self.app_factory
 
         self.process_pool = Pool(processes=self.processes,
-                                 initializer=self.__init_process, initargs=(app_factory, self.threads))
+                                 initializer=self.__init_process, initargs=(app_factory, self.threads, self.noack))
         self.rcli = aioredis.from_url(self.redis_url, decode_responses=True)
 
         __fix_call_map = {}
@@ -291,7 +299,9 @@ class Consumer:
         tasks = []
         for __call_map in call_map_groups:
             tasks.append(self.__xread(__call_map))
-            tasks.append(self.__retry(__call_map))
+
+            if self.noack == False:
+                tasks.append(self.__retry(__call_map))
 
         if job_list:
             tasks.append(self.__scheduler(job_list))
@@ -358,9 +368,7 @@ class Consumer:
                         times_delivered_map[mid] = d['times_delivered']
 
                 if message_del_ids:
-                    act_count = await self.rcli.xack(name, self.group, *message_del_ids)
-                    if act_count > 0:
-                        await self.rcli.xdel(name, *message_del_ids)
+                    await self.rcli.xack(name, self.group, *message_del_ids)
 
                 if message_ids and name in fix_call_map:
                     call = fix_call_map[name]['fc']
@@ -389,7 +397,8 @@ class Consumer:
 
         while self.__runing:
             rets = await self.rcli.xreadgroup(self.group, self.consumer_name, streams,
-                                              count=self.read_count, block=self.block_mill)
+                                              count=self.read_count, block=self.block_mill,
+                                              noack=self.noack)
             for ret in rets:
                 stream = ret[0]
                 if stream not in fix_call_map:
@@ -462,7 +471,7 @@ class Consumer:
 
             await asyncio.sleep(SCHEDULER_INTERVAL)
 
-    def __init_process(self, app_factory: str | Callable, threads: int):
+    def __init_process(self, app_factory: str | Callable, threads: int, noack: bool):
         app: Flask
         if isinstance(app_factory, str):
             app = import_string(app_factory)
@@ -482,6 +491,7 @@ class Consumer:
 
         current_process().rcli = rcli
         current_process().app = app
+        current_process().noack = noack
 
         thread_pool = None
         if threads > 1:
