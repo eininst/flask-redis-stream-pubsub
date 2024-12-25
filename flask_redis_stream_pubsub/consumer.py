@@ -39,7 +39,7 @@ SCHEDULER_LOCK_EX = 5
 
 # Consumer 常量
 CONSUMER_RETRY_LOOP_INTERVAL = 5
-CONSUMER_TASK_SPLIT_THRESHOLD = 20
+CONSUMER_TASK_SPLIT_THRESHOLD = 16
 
 # -------------------- 工具函数 --------------------
 def _thread_execute(fc: Callable, msg: "Msg"):
