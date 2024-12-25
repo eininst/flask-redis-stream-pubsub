@@ -5,20 +5,21 @@ import time
 import traceback
 import uuid
 import os
-from concurrent.futures import ThreadPoolExecutor
-from functools import wraps
-from multiprocessing import current_process, Pool
-from typing import Callable, Dict
-
 import math
 import redis
+
 from croniter import croniter
 from flask import Flask, current_app
 from werkzeug.utils import import_string, find_modules
 from redis import asyncio as aioredis
+from functools import wraps
+from concurrent.futures import ThreadPoolExecutor
+from multiprocessing import current_process, Pool
+from typing import Callable, Dict, Union
 
 from flask_redis_stream_pubsub import util
 
+# -------------------- 常量与默认配置 --------------------
 RESET = '\033[0m'
 
 logger = logging.getLogger("pubsub")
@@ -26,21 +27,25 @@ logger.setLevel(logging.INFO)
 
 ch = logging.StreamHandler()
 ch.setLevel(logger.level)
-
-formatter = logging.Formatter(f"[%(asctime)s] PUBSUB %(levelname)s - %(message)s")
+formatter = logging.Formatter("[%(asctime)s] PUBSUB %(levelname)s - %(message)s")
 ch.setFormatter(formatter)
 logger.addHandler(ch)
 
+# Scheduler 常量
 SCHEDULER_PIPE_BUFFER_SIZE = 20
 SCHEDULER_INTERVAL = 0.2
 SCHEDULER_JOB_STREAM_MAX_LEN = 256
-SCHEDULER_LOCK_EX = 7
+SCHEDULER_LOCK_EX = 5
 
-CONSUMER_RETRY_LOOP_INTERVAL = 3
+# Consumer 常量
+CONSUMER_RETRY_LOOP_INTERVAL = 5
 CONSUMER_TASK_SPLIT_THRESHOLD = 20
 
-
-def _thread_excute(fc, msg):
+# -------------------- 工具函数 --------------------
+def _thread_execute(fc: Callable, msg: "Msg"):
+    """
+    线程执行函数，提交到 thread_pool 或直接调用。
+    """
     if current_process().thread_pool is None:
         fc(msg)
     else:
@@ -48,191 +53,285 @@ def _thread_excute(fc, msg):
 
 
 class Msg:
+    """
+    消费者从 Redis stream 拿到的消息结构
+    """
     __slots__ = ['stream_name', 'id', 'group_name', 'payload', 'consumer_name', 'retry_count']
 
-    def __init__(self, stream_name, id, group_name, payload: Dict, consumer_name, retry_count=0):
+    def __init__(self, stream_name: str, msg_id: str, group_name: str, payload: Dict,
+                 consumer_name: str, retry_count: int = 0):
         self.stream_name = stream_name
-        self.id = id
+        self.id = msg_id
         self.group_name = group_name
-        self.payload: dict = payload
+        self.payload = payload
         self.consumer_name = consumer_name
         self.retry_count = retry_count
 
     def __str__(self):
-        return f"Msg({self.consumer_name}-{self.id}-{self.stream_name}-{self.payload}-{self.group_name}-{self.retry_count})"
+        return (f"Msg({self.consumer_name}-{self.id}-"
+                f"{self.stream_name}-{self.payload}-"
+                f"{self.group_name}-{self.retry_count})")
 
     @property
     def source(self) -> str:
-        if '__SOURCE' in self.payload:
-            return self.payload['__SOURCE']
-        return ''
+        return self.payload.get('__SOURCE', '')
 
     @property
     def publish_time(self) -> int:
-        if '__PUBLISH_TIME' in self.payload:
-            return int(self.payload['__PUBLISH_TIME'])
-        return 0
+        return int(self.payload.get('__PUBLISH_TIME', 0))
 
 
 class Consumer:
+    """
+    核心消费者类，负责订阅/消费 Redis Stream 中的消息，支持多进程 + 多线程。
+    """
 
-    def __init__(self,
-                 consumer_name: str,
-                 group='',
-                 processes=1,
-                 threads=1,
-                 retry_count=64,
-                 timeout_second=300,
-                 block_second=6,
-                 read_count=16,
-                 noack=False,
-                 config_prefix='PUBSUB_REDIS',
-                 app_factory: str | Callable = None):
-
+    def __init__(
+        self,
+        consumer_name: str,
+        group: str = '',
+        processes: int = 1,
+        threads: int = 1,
+        retry_count: int = 64,
+        timeout_second: int = 300,
+        block_second: int = 5,
+        read_count: int = 16,
+        noack: bool = False,
+        config_prefix: str = 'PUBSUB_REDIS',
+        app_factory: Union[str, Callable] = None
+    ):
+        """
+        :param consumer_name: 消费者名称
+        :param group: Redis Stream Group 名称
+        :param processes: 启动的进程数
+        :param threads: 每个进程可用的线程数
+        :param retry_count: 超过此次数后自动 ack
+        :param timeout_second: 超时时间，单位秒
+        :param block_second: xreadgroup 阻塞时间，单位秒
+        :param read_count: 每次读取消息数量
+        :param noack: 是否无需手动 ack
+        :param config_prefix: 配置前缀
+        :param app_factory: Flask app 工厂，或者其 import string
+        """
         self.app_factory = app_factory
         self.group = group
         self.timeout_mill = timeout_second * 1000
         self.block_mill = block_second * 1000
         self.read_count = read_count
-        self.rcli = None
-        self.processes = processes
-        self.threads = threads
         self.retry_count = retry_count
         self.consumer_name = consumer_name
         self.noack = noack
 
-        self.__runing = True
-        self.__call_map = {}
-        self.xgroup_check = None
+        self.processes = processes
+        self.threads = threads
+        self.__running = True
+        self.__call_map = {}  # 订阅函数映射
+        self.config_prefix = config_prefix
+        self.redis_url = ""
+
+        self.rcli = None
         self.process_pool = None
 
-        self.config_prefix = config_prefix
-        self.redis_url = ''
-
-    def init_obj(self, obj):
+    # -------------------- 配置相关 --------------------
+    def init_obj(self, obj: Union[str, object]):
+        """
+        从一个对象或 import string 获取配置（类似 Flask config）。
+        """
         if isinstance(obj, str):
             obj = import_string(obj)
 
-        cfg = {}
-        for key in dir(obj):
-            if key.isupper():
-                cfg[key] = getattr(obj, key)
-
-        redis_url = cfg.get(
-            "{0}_URL".format(self.config_prefix), "redis://localhost:6379/0"
-        )
-        self.redis_url = redis_url
+        cfg = {
+            key: getattr(obj, key)
+            for key in dir(obj) if key.isupper()
+        }
+        self.redis_url = cfg.get(f"{self.config_prefix}_URL", "redis://localhost:6379/0")
         self.__init_config(cfg)
 
     def init_app(self, app: Flask):
-        redis_url = app.config.get(
-            "{0}_URL".format(self.config_prefix), "redis://localhost:6379/0"
-        )
-        self.redis_url = redis_url
-
-        cfg = app.config.get(f'{self.config_prefix}_OPTION')
-
-        if not cfg:
-            return
-
+        """
+        从 Flask app 的 config 中读取配置。
+        """
+        self.redis_url = app.config.get(f"{self.config_prefix}_URL", "redis://localhost:6379/0")
+        cfg = app.config.get(f'{self.config_prefix}_OPTION') or {}
         self.__init_config(cfg)
 
-    def __init_config(self, cfg):
-        if 'group' in cfg:
-            self.group = cfg['group']
-        if 'processes' in cfg:
-            self.processes = cfg['processes']
-        if 'threads' in cfg:
-            self.threads = cfg['threads']
-        if 'retry_count' in cfg:
-            self.retry_count = cfg['retry_count']
-        if 'timeout_second' in cfg:
-            self.timeout_mill = int(cfg['timeout_second']) * 1000
-        if 'block_second' in cfg:
-            self.block_mill = int(cfg['block_second']) * 1000
-        if 'read_count' in cfg:
-            self.read_count = cfg['read_count']
-        if 'noack' in cfg:
-            self.noack = cfg['noack']
+    def __init_config(self, cfg: Dict):
+        """
+        初始化消费者相关配置。
+        """
+        self.group = cfg.get('group', self.group)
+        self.processes = cfg.get('processes', self.processes)
+        self.threads = cfg.get('threads', self.threads)
+        self.retry_count = cfg.get('retry_count', self.retry_count)
+        self.timeout_mill = int(cfg.get('timeout_second', self.timeout_mill // 1000)) * 1000
+        self.block_mill = int(cfg.get('block_second', self.block_mill // 1000)) * 1000
+        self.read_count = cfg.get('read_count', self.read_count)
+        self.noack = cfg.get('noack', self.noack)
 
         if 'app_factory' in cfg:
             self.app_factory = cfg['app_factory']
 
+    # -------------------- 订阅相关 --------------------
     def import_module(self, module: str):
+        """
+        递归导入指定 module 下的所有 py 文件，以触发 @subscribe 装饰器。
+        """
         for name in find_modules(module, recursive=True, include_packages=False):
             import_string(name)
 
-    def subscribe(self, stream: str, timeout: float = None, retry_count: int = None, cron: str = None):
+    def subscribe(
+        self, stream: str, timeout: float = None, retry_count: int = None, cron: str = None
+    ):
+        """
+        装饰器，用于标注某个函数订阅指定 stream。
+        :param stream: redis stream 的名称
+        :param timeout: 覆盖全局的 timeout_second 配置
+        :param retry_count: 覆盖全局的 retry_count
+        :param cron: 如果传入 cron 表达式，则变为周期性调度
+        """
         if retry_count is None:
             retry_count = self.retry_count
 
-        def decoration(f):
-            if stream in self.__call_map:
-                raise RuntimeError(f'{stream} Already exists of subscribes')
+        if cron is not None and not croniter.is_valid(cron):
+            raise RuntimeError(f'{stream} cron is invalid: {cron}')
 
-            module = __import__(f.__module__, fromlist=[''])
-            name = f.__name__
+        def decorator(func: Callable):
+            if stream in self.__call_map:
+                raise RuntimeError(f'{stream} already subscribed')
+
+            module_obj = __import__(func.__module__, fromlist=[''])
+            func_info = {
+                'module': module_obj,
+                'name': func.__name__,
+                'timeout': timeout,
+                'retry_count': retry_count,
+            }
 
             if cron is None:
-                self.__call_map[stream] = {
-                    'module': module,
-                    'name': name,
-                    'type': 'subscribe',
-                    'timeout': timeout,
-                    'retry_count': retry_count,
-                }
+                # 普通流订阅
+                func_info.update({'type': 'subscribe'})
             else:
-                if not croniter.is_valid(cron):
-                    raise RuntimeError(f'{stream} cron It is invalid by {cron}')
-
-                self.__call_map[stream] = {
-                    'module': module,
-                    'name': name,
+                # cron 定时任务
+                func_info.update({
                     'type': 'cron',
                     'cron': cron,
                     'iter': croniter(cron, second_at_beginning=True),
                     'stream': stream,
-                    'timeout': timeout,
-                    'retry_count': retry_count,
-                }
+                })
 
-            @wraps(f)
+            self.__call_map[stream] = func_info
+
+            @wraps(func)
             def wrapper(*args, **kwargs):
                 with current_process().app.app_context():
                     ack = False
                     try:
-                        msg = args[0]
-                        f(*args, **kwargs)
+                        msg = args[0]  # 第一个参数是 Msg
+                        func(*args, **kwargs)
                         ack = True
-                    except Exception as e:
-                        ack = False
-                        current_app.logger.error(f'\033[91m{traceback.format_exc()}')
-                        raise e
+                    except Exception:
+                        current_app.logger.error(f'\033[91m{traceback.format_exc()}{RESET}')
+                        raise
                     finally:
                         if current_process().noack:
                             return
-
                         cli = current_process().rcli
-                        if retry_count <= 0:
-                            ack = True
-                        if ack:
+                        # 消费过多次后，直接 ack，或者执行成功后 ack
+                        if retry_count <= 0 or ack:
                             cli.xack(msg.stream_name, msg.group_name, msg.id)
 
             return wrapper
 
-        return decoration
+        return decorator
 
-    def run(self, app_factory: str | Callable = None, **kwargs):
+    # -------------------- 运行逻辑 --------------------
+    def run(self, app_factory: Union[str, Callable] = None, **kwargs):
+        """
+        同步入口，优先尝试 uvloop。若没有则使用 asyncio.run。
+        """
         try:
             from uvloop import run
-            logger.info(f'PID({os.getpid()}) {'\033[1m'}uvloop runing...{RESET}')
+            logger.info(f'PID({os.getpid()}) \033[1muvloop running...{RESET}')
         except ImportError:
             from asyncio import run
-            logger.info(f'PID({os.getpid()}) {'\033[1m'}eventloop runing...{RESET}')
-
+            logger.info(f'PID({os.getpid()}) \033[1meventloop running...{RESET}')
         run(self.run_async(app_factory, **kwargs))
 
-    async def run_async(self, app_factory: str | Callable = None, **kwargs):
+    async def run_async(self, app_factory: Union[str, Callable] = None, **kwargs):
+        """
+        异步入口，创建进程池、初始化 Redis 连接并启动事件循环。
+        """
+
+        self.__apply_kwargs(kwargs)
+        if app_factory is None:
+            app_factory = self.app_factory
+
+        # 创建进程池
+        self.process_pool = Pool(
+            processes=self.processes,
+            initializer=self.__init_process,
+            initargs=(app_factory, self.threads, self.noack)
+        )
+        self.rcli = aioredis.from_url(self.redis_url, decode_responses=True)
+
+        # 初始化 call_map，尝试创建 xgroup
+        call_map_simple, job_list = await self.__prepare_subscribe_map()
+
+        # 检查是否存在订阅
+        if not call_map_simple:
+            raise RuntimeError('No valid subscribe found')
+
+        # 根据 call_map 的大小拆分成多组，防止单个进程任务过多
+        parts = math.ceil(len(call_map_simple) / CONSUMER_TASK_SPLIT_THRESHOLD)
+        call_map_groups = util.split_dict(call_map_simple, parts)
+
+        # 创建消费与重试的任务
+        tasks = []
+        for call_map_group in call_map_groups:
+            tasks.append(self.__xread_loop(call_map_group))
+            if not self.noack:
+                tasks.append(self.__retry_loop(call_map_group))
+
+        # 如果有 cron job，加入调度器任务
+        if job_list:
+            tasks.append(self.__scheduler_loop(job_list))
+
+        logger.info(
+            f"PID({os.getpid()}) \033[94m"
+            f"Parameters: processes={self.processes}, threads={self.threads}, "
+            f"consumer_name={self.consumer_name}, group_id={self.group}{RESET}"
+        )
+        logger.info(
+            f"PID({os.getpid()}) \033[96m"
+            f"Discovery of subscribers: {', '.join(call_map_simple.keys())}{RESET}"
+        )
+
+        # 注册信号，用于优雅退出
+        def _shutdown_handler(signum, frame):
+            self.__running = False
+            logger.warning(
+                f"PID({os.getpid()}) \033[93m"
+                f"Received signum={signum}, shutting down...PID({os.getpid()}){RESET}"
+            )
+
+        signal.signal(signal.SIGINT, _shutdown_handler)
+        signal.signal(signal.SIGTERM, _shutdown_handler)
+
+        # 并发执行所有任务
+        await asyncio.gather(*tasks)
+
+        self.process_pool.terminate()
+        self.process_pool.join()
+
+        logger.info(
+            f"PID({os.getpid()}) \033[92m"
+            f"Consumer shutdown successfully, PID({os.getpid()}){RESET}"
+        )
+
+    def __apply_kwargs(self, kwargs: Dict):
+        """
+        将 run_async() 里传入的关键字参数应用到当前 consumer 实例上。
+        """
         redis_url = kwargs.get('redis_url')
         group = kwargs.get('group')
         processes = kwargs.get("processes")
@@ -252,278 +351,267 @@ class Consumer:
             self.processes = processes
         if threads:
             self.threads = threads
-        if retry_count:
-            self.read_count = retry_count
-        if timeout_second:
+        if retry_count is not None:
+            self.retry_count = retry_count
+        if timeout_second is not None:
             self.timeout_mill = int(timeout_second) * 1000
-        if block_second:
+        if block_second is not None:
             self.block_mill = int(block_second) * 1000
-        if read_count:
+        if read_count is not None:
             self.read_count = read_count
         if config_prefix:
             self.config_prefix = config_prefix
         if noack is not None:
             self.noack = noack
 
-        if app_factory is None:
-            app_factory = self.app_factory
-
-        self.process_pool = Pool(processes=self.processes,
-                                 initializer=self.__init_process, initargs=(app_factory, self.threads, self.noack))
-        self.rcli = aioredis.from_url(self.redis_url, decode_responses=True)
-
-        __fix_call_map = {}
+    async def __prepare_subscribe_map(self):
+        """
+        对订阅信息（__call_map）进行预处理，包括 xgroup 创建和区分 cron 与普通订阅。
+        """
+        call_map_simple = {}
         job_list = []
 
-        for k, v in self.__call_map.items():
-            __fix_call_map[k] = {
-                'fc': getattr(v['module'], v['name']),
-                'timeout': v['timeout'],
-                'retry_count': v['retry_count'],
+        for stream_name, info in self.__call_map.items():
+            # 准备核心调用函数
+            fc = getattr(info['module'], info['name'])
+            call_map_simple[stream_name] = {
+                'fc': fc,
+                'timeout': info.get('timeout'),
+                'retry_count': info.get('retry_count')
             }
-
+            # 创建 xgroup
             try:
-                await self.rcli.xgroup_create(name=k, groupname=self.group, id='0', mkstream=True)
+                # 这里用 redis-py 的 response error
+
+                await self.rcli.xgroup_create(
+                    name=stream_name, groupname=self.group, id='0', mkstream=True
+                )
+
             except redis.exceptions.ResponseError:
                 pass
 
-            if v['type'] == 'cron':
-                job_list.append(v)
+            # 如果是 cron
+            if info['type'] == 'cron':
+                job_list.append(info)
 
-        if not __fix_call_map:
-            raise RuntimeError('Not subscribe')
+        return call_map_simple, job_list
 
-        parts = math.ceil(len(__fix_call_map) / CONSUMER_TASK_SPLIT_THRESHOLD)
-        call_map_groups = util.split_dict(__fix_call_map, parts)
-
-        tasks = []
-        for __call_map in call_map_groups:
-            tasks.append(self.__xread(__call_map))
-
-            if self.noack == False:
-                tasks.append(self.__retry(__call_map))
-
-        if job_list:
-            tasks.append(self.__scheduler(job_list))
-
-        logger.info(
-            f"PID({os.getpid()}) {'\033[94m'}Parameters: processes={self.processes},threads={self.threads},consumer_name={self.consumer_name},group_id={self.group}{RESET}")
-        logger.info(
-            f"PID({os.getpid()}) {'\033[96m'}Discovery of subscribers: {",".join(__fix_call_map.keys())}{RESET}")
-
-        def __shutdown(signum, frame):
-            self.__runing = False
-            logger.warning(
-                f"PID({os.getpid()}) {'\033[93m'}Listen signum:{signum}, Start to shutdown...PID({os.getpid()}){RESET}")
-
-        signal.signal(signal.SIGINT, __shutdown)
-        signal.signal(signal.SIGTERM, __shutdown)
-
-        await asyncio.gather(*tasks)
-
-        self.process_pool.terminate()
-        self.process_pool.join()
-
-        logger.info(f"PID({os.getpid()}) {'\033[92m'}Shutting down consumer successfully PID({os.getpid()}){RESET}")
-
-    async def __retry(self, fix_call_map):
-        while self.__runing:
+    # -------------------- 消费与重试逻辑 --------------------
+    async def __retry_loop(self, fix_call_map: Dict):
+        """
+        周期性地检查超时的 pending message 并进行重试。
+        """
+        while self.__running:
             async with self.rcli.pipeline() as pipe:
                 stream_list = []
                 for k, val in fix_call_map.items():
-                    _timeout_mill = self.timeout_mill
-                    _opt_timeout = val['timeout']
-
-                    if _opt_timeout:
-                        _timeout_mill = int(float(_opt_timeout) * 1000)
-
+                    _timeout_mill = val['timeout'] * 1000 if val['timeout'] else self.timeout_mill
                     _retry_count = val['retry_count']
                     stream_list.append({
                         'name': k,
                         'retry_count': _retry_count,
-                        'timeout_mill': _timeout_mill,
+                        'timeout_mill': _timeout_mill
                     })
-                    await pipe.xpending_range(k, self.group, "0", "+",
-                                              count=self.read_count, idle=_timeout_mill)
+                    await pipe.xpending_range(
+                        k, self.group, "0", "+", count=self.read_count, idle=_timeout_mill
+                    )
 
                 res = await pipe.execute()
 
             call_count = 0
-            for i in range(len(res)):
-                message_ids = []
-                message_del_ids = []
-                times_delivered_map = {}
-
+            # 针对每个 stream 分别处理
+            for i, pendings in enumerate(res):
                 stream_dict = stream_list[i]
-                name = stream_dict['name']
-                retry_count = stream_dict['retry_count']
+                stream_name = stream_dict['name']
+                retry_count_limit = stream_dict['retry_count']
                 timeout_mill = stream_dict['timeout_mill']
 
-                for d in res[i]:
-                    if d['times_delivered'] > retry_count:
-                        message_del_ids.append(d['message_id'])
+                message_ids, message_del_ids, times_delivered_map = [], [], {}
+                for pending_item in pendings:
+                    if pending_item['times_delivered'] > retry_count_limit:
+                        message_del_ids.append(pending_item['message_id'])
                     else:
-                        mid = d['message_id']
+                        mid = pending_item['message_id']
                         message_ids.append(mid)
-                        times_delivered_map[mid] = d['times_delivered']
+                        times_delivered_map[mid] = pending_item['times_delivered']
 
+                # 超过最大重试次数，直接 ack
                 if message_del_ids:
-                    await self.rcli.xack(name, self.group, *message_del_ids)
+                    await self.rcli.xack(stream_name, self.group, *message_del_ids)
 
-                if message_ids and name in fix_call_map:
-                    call = fix_call_map[name]['fc']
-                    xmsgs = await self.rcli.xclaim(name, self.group,
-                                                   self.consumer_name, timeout_mill, message_ids)
-
-                    for msg in xmsgs:
-                        id = msg[0]
-                        payload = msg[1]
-                        times_delivered = times_delivered_map[id]
-
-                        _msg = Msg(name, id, self.group, payload,
-                                   self.consumer_name, retry_count=times_delivered)
-
-                        self.process_pool.apply_async(_thread_excute, (call, _msg,))
-
+                # 尝试 xclaim
+                if message_ids and stream_name in fix_call_map:
+                    fc = fix_call_map[stream_name]['fc']
+                    xmsgs = await self.rcli.xclaim(
+                        stream_name, self.group, self.consumer_name, timeout_mill, message_ids
+                    )
+                    for xmsg in xmsgs:
+                        mid = xmsg[0]
+                        payload = xmsg[1]
+                        retry_count_now = times_delivered_map[mid]
+                        _msg = Msg(stream_name, mid, self.group, payload,
+                                   self.consumer_name, retry_count=retry_count_now)
+                        self.process_pool.apply_async(_thread_execute, (fc, _msg,))
                         call_count += 1
 
-            if call_count > 0:
-                await asyncio.sleep(0)
-            else:
+            # 若这一轮没有处理到消息，则等待一会再继续
+            if call_count == 0:
                 await asyncio.sleep(CONSUMER_RETRY_LOOP_INTERVAL)
+            else:
+                await asyncio.sleep(0)
 
-    async def __xread(self, fix_call_map):
+    async def __xread_loop(self, fix_call_map: Dict):
+        """
+        持续地通过 XREADGROUP 拉取消息并分发给进程池执行。
+        """
         streams = {key: ">" for key in fix_call_map.keys()}
-
-        while self.__runing:
-            rets = await self.rcli.xreadgroup(self.group, self.consumer_name, streams,
-                                              count=self.read_count, block=self.block_mill,
-                                              noack=self.noack)
+        while self.__running:
+            rets = await self.rcli.xreadgroup(
+                self.group,
+                self.consumer_name,
+                streams,
+                count=self.read_count,
+                block=self.block_mill,
+                noack=self.noack
+            )
             for ret in rets:
-                stream = ret[0]
-                if stream not in fix_call_map:
-                    current_app.logger.error(f'{stream} not in call funcs')
+                stream_name = ret[0]
+                if stream_name not in fix_call_map:
+                    current_app.logger.error(f'{stream_name} not in call funcs')
                     continue
 
-                for msg in ret[1]:
-                    id = msg[0]
-                    payload = msg[1]
+                for msg_id, payload in ret[1]:
+                    _msg = Msg(stream_name, msg_id, self.group, payload, self.consumer_name)
+                    fc = fix_call_map[stream_name]['fc']
+                    self.process_pool.apply_async(_thread_execute, (fc, _msg,))
 
-                    _msg = Msg(stream, id, self.group, payload, self.consumer_name)
-
-                    call = fix_call_map[stream]['fc']
-
-                    self.process_pool.apply_async(_thread_excute, (call, _msg,))
-
-    async def __job_pipe_xadds(self, jobs):
-        async with self.rcli.pipeline() as pipe:
-            for j in jobs:
-                key = f'{j["stream"]}_{j["next_time"]}'
-                uid = str(uuid.uuid4()).replace("-", "").upper()
-                await pipe.set(f'{key}', uid, ex=SCHEDULER_LOCK_EX, nx=True)
-
-            res = await pipe.execute()
-
-            xcount = 0
-            for i in range(len(jobs)):
-                if res[i]:
-                    job = jobs[i]
-                    payload = {
-                        '__PUBLISH_TIME': int(time.time() * 1000),
-                        '__SOURCE': 'cron',
-                    }
-                    await pipe.xadd(job['stream'], payload, maxlen=SCHEDULER_JOB_STREAM_MAX_LEN)
-                    xcount += 1
-
-            if xcount > 0:
-                await pipe.execute()
-
-            return xcount
-
-    async def __scheduler(self, jobs):
-        __jobs = []
-
+    # -------------------- 调度器 (cron) --------------------
+    async def __scheduler_loop(self, jobs: list):
+        """
+        对 cron 类型的任务进行调度，将任务写入对应 stream。
+        """
+        cron_jobs = []
         start_time = time.time()
+
         for job in jobs:
-            __jobs.append({
+            cron_jobs.append({
                 'iter': job['iter'],
                 'stream': job['stream'],
-                'last_time': int(job['iter'].get_next(start_time=start_time)),
+                'last_time': int(job['iter'].get_next(start_time=start_time))
             })
 
-        while self.__runing:
+        while self.__running:
             current_time = time.time()
             zjobs = []
-
-            for job in __jobs:
+            for job in cron_jobs:
                 _next_time = int(job['iter'].get_next(start_time=current_time))
-
                 if job['last_time'] != _next_time:
                     zjobs.append({
                         'stream': job["stream"],
-                        'next_time': _next_time,
+                        'next_time': _next_time
                     })
                     job['last_time'] = _next_time
 
             if zjobs:
-                chunkd_jobs = util.chunk_array(zjobs, SCHEDULER_PIPE_BUFFER_SIZE)
-                await asyncio.gather(*map(self.__job_pipe_xadds, chunkd_jobs))
+                # 分批次写入 pipeline，防止 pipeline 太长
+                chunked_jobs = util.chunk_array(zjobs, SCHEDULER_PIPE_BUFFER_SIZE)
+                await asyncio.gather(*[self.__job_pipe_xadds(chunk) for chunk in chunked_jobs])
 
             await asyncio.sleep(SCHEDULER_INTERVAL)
 
-    def __init_process(self, app_factory: str | Callable, threads: int, noack: bool):
-        app: Flask
+    async def __job_pipe_xadds(self, jobs: list) -> int:
+        """
+        将 cron job 写入对应 stream，每次写入前先 set nx 做锁，防止重复。
+        """
+        async with self.rcli.pipeline() as pipe:
+            for job in jobs:
+                key = f'{job["stream"]}_{job["next_time"]}'
+                uid = uuid.uuid4().hex.upper()
+                await pipe.set(key, uid, ex=SCHEDULER_LOCK_EX, nx=True)
+
+            set_res = await pipe.execute()
+
+            xcount = 0
+            # 对成功 set 的 key，再真正 xadd
+            async with self.rcli.pipeline() as pipe2:
+                for i, success in enumerate(set_res):
+                    if success:
+                        job = jobs[i]
+                        payload = {
+                            '__PUBLISH_TIME': int(time.time() * 1000),
+                            '__SOURCE': 'cron'
+                        }
+                        await pipe2.xadd(job['stream'], payload, maxlen=SCHEDULER_JOB_STREAM_MAX_LEN)
+                        xcount += 1
+                if xcount > 0:
+                    await pipe2.execute()
+
+            return xcount
+
+    # -------------------- 进程初始化 --------------------
+    def __init_process(self, app_factory: Union[str, Callable], threads: int, noack: bool):
+        """
+        初始化子进程时会调用，用于设置独立的 Flask app、Redis 连接和线程池等。
+        """
+        # 初始化 Flask app
         if isinstance(app_factory, str):
             app = import_string(app_factory)
         elif callable(app_factory):
             app = app_factory()
         else:
-            raise RuntimeError("flask app is not initialization")
+            raise RuntimeError("Invalid Flask app_factory")
 
         if app is None:
-            raise RuntimeError("flask app is not initialization")
+            raise RuntimeError("Flask app not initialized")
 
-        redis_url = app.config.get(
-            "{0}_URL".format(self.config_prefix), "redis://localhost:6379/0"
-        )
-
+        # 初始化 Redis client
+        redis_url = app.config.get(f"{self.config_prefix}_URL", "redis://localhost:6379/0")
         rcli = redis.from_url(redis_url, decode_responses=True)
 
         current_process().rcli = rcli
         current_process().app = app
         current_process().noack = noack
 
+        # 如果需要多线程
         thread_pool = None
         if threads > 1:
-            thread_pool = ThreadPoolExecutor(max_workers=threads, thread_name_prefix='PUBSUB')
+            thread_pool = ThreadPoolExecutor(
+                max_workers=threads,
+                thread_name_prefix='PUBSUB'
+            )
             current_process().thread_pool = thread_pool
 
-        def shutdown(signum, frame):
+        def _shutdown(signum, frame):
+            """
+            进程收到终止信号时的清理逻辑，比如关闭线程池。
+            """
             if thread_pool is not None:
                 thread_pool.shutdown()
 
-        signal.signal(signal.SIGTERM, shutdown)
+        signal.signal(signal.SIGTERM, _shutdown)
 
 
-def runs(*consumers: Consumer, app_factory: str | Callable = None):
-    if len(consumers) == 0:
-        raise RuntimeError("consumers cannot be empty")
-
-    plist = []
+def runs(*consumers: Consumer, app_factory: Union[str, Callable] = None):
+    """
+    同时运行多个 consumer，分别以独立的进程来执行。
+    """
+    if not consumers:
+        raise RuntimeError("No consumers provided")
 
     from multiprocessing import Process
 
+    processes = []
     for c in consumers:
         p = Process(target=c.run, args=(app_factory,))
-        plist.append(p)
+        processes.append(p)
         p.start()
 
-    def shutdown(signum, frame):
-        for p in plist:
+    def _shutdown_all(signum, frame):
+        for p in processes:
             p.terminate()
 
-    signal.signal(signal.SIGINT, shutdown)
-    signal.signal(signal.SIGTERM, shutdown)
+    signal.signal(signal.SIGINT, _shutdown_all)
+    signal.signal(signal.SIGTERM, _shutdown_all)
 
-    for p in plist:
+    for p in processes:
         p.join()

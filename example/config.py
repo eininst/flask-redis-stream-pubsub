@@ -1,5 +1,5 @@
 # PUBSUB_REDIS_URL = 'redis://:password@host:6379/0'
-PUBSUB_REDIS_URL = 'redis://:7c3cD505@r-2vc5fd2ly3uxdrlwh0pd.redis.cn-chengdu.rds.aliyuncs.com:6379/0'
+PUBSUB_REDIS_URL = 'redis://host.docker.internal:6379/0'
 
 PUBSUB_REDIS_OPTION = {
     'group': 'pubsub_g1',  # 消息分组 -> redis XGROUP groupname

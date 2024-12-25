@@ -1,5 +1,4 @@
 import logging
-import time
 
 from flask import Flask, current_app
 from flask_redis_stream_pubsub.consumer import Consumer, Msg, runs
@@ -9,11 +8,6 @@ app.config.from_object("example.config")
 app.logger.setLevel(logging.INFO)
 
 if __name__ == '__main__':
-    import multiprocessing as mp
-
-    mp.set_start_method('fork')
-
-
     cs = Consumer(__name__)
 
 
@@ -25,7 +19,7 @@ if __name__ == '__main__':
 
     @cs.subscribe("hello_word_retry", retry_count=3, timeout=10)
     def hello_word_retry(msg: Msg):
-        """ 重试3次, 每次间隔30秒 """
+        """ 重试3次, 每次间隔10秒 """
         current_app.logger.info(msg)
         raise RuntimeError("I will retry 3 times, with a 30 second interval between each attempt")
 
