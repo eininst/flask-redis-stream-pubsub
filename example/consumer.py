@@ -21,7 +21,7 @@ if __name__ == '__main__':
     def hello_word_retry(msg: Msg):
         """ 重试3次, 每次间隔10秒 """
         current_app.logger.info(msg)
-        raise RuntimeError("I will retry 3 times, with a 30 second interval between each attempt")
+        raise RuntimeError("I will retry 3 times, with a 10 second interval between each attempt")
 
 
     @cs.subscribe("hello_word_cron", cron="*/3 * * * * *", retry_count=0)
