@@ -28,14 +28,6 @@ Python 版本要求：**3.8+**
 ```bash
 pip install flask-redis-stream-pubsub
 ```
-
-或者从源码安装：
-```bash
-git clone https://github.com/eininst/flask-redis-stream-pubsub.git
-cd flask-redis-stream-pubsub
-python setup.py install
-```
-
 ## Producer
 ### 1. 创建 Producer（生产者）
 
