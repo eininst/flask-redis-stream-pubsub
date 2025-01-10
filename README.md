@@ -177,6 +177,10 @@ logging.getLogger("pubsub").setLevel(logging.DEBUG)
 ## More Example
 > See [example](/example)
 
+### Cron Expression
+> See [corpusops/croniter](https://github.com/corpusops/croniter)
+
+
 ## 开发与贡献
 欢迎参与本项目开发和提交 Issue/PR：
 
